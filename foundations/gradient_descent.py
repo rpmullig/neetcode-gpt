@@ -16,4 +16,4 @@ class Solution:
             x = x - learning_rate * derivative_function(x)
 
 
-        return round(x,5)
+        return round(x, 5)
