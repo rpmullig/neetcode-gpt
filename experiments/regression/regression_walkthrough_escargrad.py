@@ -90,7 +90,12 @@ class Snail:
         # np.zeros_like: start every gradient at zero; backward() adds into it
         self.grad: np.ndarray = np.zeros_like(self.data)
         # the "trail": which Snails fed into this one...
-        self._parents = set(_parents)
+        self._parents = tuple(_parents)
+        # ...how to RECOMPUTE our data from those parents. This is the key to
+        # freezing: a static graph replays these forward rules with new numbers
+        # instead of rebuilding the whole trail. Leaves (inputs/weights) keep
+        # their own data and have no forward rule.
+        self._forward = None
         # ...and the local-derivative rule for the op that made this Snail.
         self._backward = lambda: None
 
@@ -99,12 +104,17 @@ class Snail:
         """Turn a raw number/array into a constant Snail if it isn't one."""
         return other if isinstance(other, Snail) else Snail(other)
 
-    def _make(self, data, parents, backward_rule) -> "Snail":
-        """Build the result Snail and attach its backward rule — but only
-        record the trail if (a) we're recording and (b) a parent needs grad."""
+    def _make(self, forward_rule, parents, backward_rule) -> "Snail":
+        """Build the result Snail from a REPLAYABLE forward rule and attach its
+        backward rule — but only record the trail if (a) we're recording and
+        (b) a parent needs grad.
+
+        Storing `forward_rule` (not just the computed data) is exactly what lets
+        us later freeze the graph and replay it without rebuilding anything."""
         track = is_recording() and any(p.requires_grad for p in parents)
-        out = Snail(data, requires_grad=track, _parents=parents if track else ())
+        out = Snail(forward_rule(), requires_grad=track, _parents=parents if track else ())
         if track:
+            out._forward = forward_rule
             out._backward = backward_rule
         return out
 
@@ -112,10 +122,17 @@ class Snail:
         # np.zeros_like: wipe the stored gradient before the next backward pass
         self.grad = np.zeros_like(self.data)
 
-    # -- operations (each records its own local derivative) --------------
+    # -- operations (each records a replayable forward + a local derivative) --
+    # Every op passes a `forward_rule` (recompute my data from my parents) and a
+    # `backward_rule` (push my gradient to my parents). The backward rules read
+    # `.data`/`.grad` at CALL time, never values captured at build time, so the
+    # same closures stay correct when a frozen graph replays them.
     def add(self, other) -> "Snail":
         other = self._wrap(other)
-        out_data = self.data + other.data
+
+        def forward_rule():
+            # element-wise sum of the two arrays
+            return self.data + other.data
 
         def backward_rule():
             # derivative of a sum passes the gradient straight through to both
@@ -124,12 +141,15 @@ class Snail:
             if other.requires_grad:
                 other.grad += _unbroadcast(out.grad, other.data.shape)
 
-        out = self._make(out_data, (self, other), backward_rule)
+        out = self._make(forward_rule, (self, other), backward_rule)
         return out
 
     def subtract(self, other) -> "Snail":
         other = self._wrap(other)
-        out_data = self.data - other.data
+
+        def forward_rule():
+            # element-wise difference of the two arrays
+            return self.data - other.data
 
         def backward_rule():
             # d(a-b): +grad flows to a, -grad flows to b
@@ -138,13 +158,15 @@ class Snail:
             if other.requires_grad:
                 other.grad += _unbroadcast(-out.grad, other.data.shape)
 
-        out = self._make(out_data, (self, other), backward_rule)
+        out = self._make(forward_rule, (self, other), backward_rule)
         return out
 
     def multiply(self, other) -> "Snail":
         other = self._wrap(other)
-        # element-wise multiply of the two arrays
-        out_data = self.data * other.data
+
+        def forward_rule():
+            # element-wise multiply of the two arrays
+            return self.data * other.data
 
         def backward_rule():
             # d(a*b)/da = b, and d(a*b)/db = a  (each scaled by the incoming grad)
@@ -153,13 +175,15 @@ class Snail:
             if other.requires_grad:
                 other.grad += _unbroadcast(self.data * out.grad, other.data.shape)
 
-        out = self._make(out_data, (self, other), backward_rule)
+        out = self._make(forward_rule, (self, other), backward_rule)
         return out
 
     def matmul(self, other) -> "Snail":
         other = self._wrap(other)
-        # the actual matrix multiply (@) for the forward pass
-        out_data = self.data @ other.data
+
+        def forward_rule():
+            # the actual matrix multiply (@) for the forward pass
+            return self.data @ other.data
 
         def backward_rule():
             g = out.grad
@@ -175,84 +199,96 @@ class Snail:
                 # dL/dB = A^T @ G
                 other.grad += (A.T @ G).reshape(other.data.shape)
 
-        out = self._make(out_data, (self, other), backward_rule)
+        out = self._make(forward_rule, (self, other), backward_rule)
         return out
 
     def pow(self, k: float) -> "Snail":
-        # raise every element to the power k
-        out_data = self.data ** k
+        def forward_rule():
+            # raise every element to the power k
+            return self.data ** k
 
         def backward_rule():
             # power rule: d(x^k)/dx = k * x^(k-1)
             if self.requires_grad:
                 self.grad += (k * self.data ** (k - 1)) * out.grad
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def neg(self) -> "Snail":
-        out_data = -self.data
+        def forward_rule():
+            # flip the sign of every element
+            return -self.data
 
         def backward_rule():
             # d(-x)/dx = -1
             if self.requires_grad:
                 self.grad += -out.grad
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def sum(self) -> "Snail":
-        # np.sum: collapse the whole array to a single number
-        out_data = self.data.sum()
+        def forward_rule():
+            # np.sum: collapse the whole array to a single number
+            return self.data.sum()
 
         def backward_rule():
             # every element contributed equally, so each gets the same grad back
             if self.requires_grad:
                 self.grad += np.ones_like(self.data) * out.grad
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def mean(self) -> "Snail":
-        # np.mean: average of all elements -> a single number
-        out_data = self.data.mean()
-        n = self.data.size
+        def forward_rule():
+            # np.mean: average of all elements -> a single number
+            return self.data.mean()
 
         def backward_rule():
             # mean = sum / n, so each element's share of the grad is grad / n
             if self.requires_grad:
+                n = self.data.size
                 self.grad += np.ones_like(self.data) * (out.grad / n)
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def sigmoid(self) -> "Snail":
-        # np.exp: 1/(1+e^-x) squashes each value into (0, 1)
-        s = 1.0 / (1.0 + np.exp(-self.data))
+        def forward_rule():
+            # np.exp: 1/(1+e^-x) squashes each value into (0, 1)
+            return 1.0 / (1.0 + np.exp(-self.data))
 
         def backward_rule():
-            # neat identity: d sigmoid/dx = sigmoid * (1 - sigmoid)
+            # neat identity: d sigmoid/dx = sigmoid * (1 - sigmoid).
+            # Read out.data (recomputed on every replay) rather than a value
+            # captured at build time — otherwise a frozen graph would keep
+            # using the very first pass's sigmoid and compute a stale gradient.
             if self.requires_grad:
+                s = out.data
                 self.grad += s * (1 - s) * out.grad
 
-        out = self._make(s, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def log(self) -> "Snail":
-        # np.log: natural log of each element
-        out_data = np.log(self.data)
+        def forward_rule():
+            # np.log: natural log of each element
+            return np.log(self.data)
 
         def backward_rule():
             # d(log x)/dx = 1/x
             if self.requires_grad:
                 self.grad += (1.0 / self.data) * out.grad
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     def clip(self, lo: float, hi: float) -> "Snail":
-        # np.clip: pin values into [lo, hi] (keeps log() away from 0)
-        out_data = np.clip(self.data, lo, hi)
+        def forward_rule():
+            # np.clip: pin values into [lo, hi] (keeps log() away from 0)
+            return np.clip(self.data, lo, hi)
 
         def backward_rule():
             # gradient flows only where we did NOT clip; clipped spots are flat
@@ -260,7 +296,7 @@ class Snail:
                 mask = (self.data >= lo) & (self.data <= hi)
                 self.grad += mask * out.grad
 
-        out = self._make(out_data, (self,), backward_rule)
+        out = self._make(forward_rule, (self,), backward_rule)
         return out
 
     # -- the backward pass ----------------------------------------------
@@ -290,6 +326,75 @@ class Snail:
 
     def __repr__(self) -> str:
         return f"Snail(data={self.data}, requires_grad={self.requires_grad})"
+
+
+# ===========================================================================
+# FREEZE: turn a one-off trail into a reusable STATIC GRAPH.
+#
+# The eager loop above rebuilds the whole trail every iteration — same shape,
+# same ops, over and over. Wasteful. Since the graph's *structure* never
+# changes (only the numbers flowing through it do), we can capture it once and
+# just replay it. That captured, replayable graph is a "static graph"; building
+# it once and reusing it is what PyTorch's torch.compile / JAX's jit do for real.
+# ===========================================================================
+def _topological_order(root: "Snail"):
+    """List every node with parents-before-children (compute order)."""
+    order, visited = [], set()
+
+    def visit(node: "Snail"):
+        if id(node) not in visited:
+            visited.add(id(node))
+            for parent in node._parents:
+                visit(parent)
+            order.append(node)
+
+    visit(root)
+    return order
+
+
+class FrozenGraph:
+    """A trail captured ONCE and replayed many times.
+
+    - forward(): recompute every node's data from the current leaf values,
+      in the frozen order — no new Snails, no closures, no allocations.
+    - backward(): walk that same frozen order in reverse to fill the leaves'
+      gradients.
+
+    We do zero graph-building per step, which is exactly the overhead the eager
+    loop pays over and over.
+    """
+
+    def __init__(self, loss: "Snail", params):
+        self.loss = loss
+        self.params = list(params)                 # the leaves we differentiate
+        # captured ONCE: the compute order and which nodes must recompute.
+        self.order = _topological_order(loss)
+        self._recompute = [n for n in self.order if n._forward is not None]
+
+    def forward(self) -> np.ndarray:
+        # Replay the forward pass: each node recomputes its data from its
+        # parents' (already-updated) data. Leaves are skipped — they hold the
+        # current weights, which the training loop pokes directly.
+        for node in self._recompute:
+            node.data = node._forward()
+        return self.loss.data
+
+    def backward(self) -> None:
+        # Reused node objects accumulate into .grad, so wipe them first.
+        for node in self.order:
+            node.grad.fill(0.0)
+        # Seed d(loss)/d(loss) = 1, then replay the local derivatives in reverse.
+        self.loss.grad.fill(1.0)
+        for node in reversed(self.order):
+            node._backward()
+
+
+def freeze(loss: "Snail", params) -> FrozenGraph:
+    """Capture the graph that produced `loss` so it can be replayed cheaply.
+
+    `params` are the leaf Snails whose gradients you want back (the weights).
+    """
+    return FrozenGraph(loss, params)
 
 
 # ===========================================================================
@@ -330,9 +435,11 @@ class Model(ABC):
         verbose: bool = False,
     ) -> NDArray[np.float64]:
         # X and Y are constants (no gradient needed); weights are what we tune.
+        # np.array: COPY the starting weights — we update them in place below,
+        # and must not clobber the caller's array (np.asarray would alias it).
         X_snail = Snail(X)
         Y_snail = Snail(Y)
-        weights = Snail(initial_weights, requires_grad=True)
+        weights = Snail(np.array(initial_weights, dtype=np.float64), requires_grad=True)
 
         for iteration in range(num_iterations):
             # 1. Forward pass: build a fresh trail with the current weights.
@@ -354,6 +461,41 @@ class Model(ABC):
                 weights.data -= self.learning_rate * weights.grad
 
         # np.round: rounds the final learned weights to 5 decimal places
+        return np.round(weights.data, 5)
+
+    # --- Component: the training loop, FROZEN (static graph) ------------
+    # Identical math to train_model above, but the graph is built ONCE and
+    # replayed — no per-iteration trail rebuilding. Same answer, less overhead.
+    def train_model_frozen(
+        self,
+        X: NDArray[np.float64],
+        Y: NDArray[np.float64],
+        num_iterations: int,
+        initial_weights: NDArray[np.float64],
+        verbose: bool = False,
+    ) -> NDArray[np.float64]:
+        # np.array: COPY the starting weights (we mutate them in place below).
+        X_snail = Snail(X)
+        Y_snail = Snail(Y)
+        weights = Snail(np.array(initial_weights, dtype=np.float64), requires_grad=True)
+
+        # Build the trail exactly once, then freeze it into a static graph.
+        loss = self.loss(self.forward(X_snail, weights), Y_snail)
+        graph = freeze(loss, [weights])
+
+        for iteration in range(num_iterations):
+            # Replay (no rebuilding): forward from current weights, then backward.
+            graph.forward()
+            graph.backward()
+
+            if verbose:
+                print(f"iter {iteration:>4}  loss={float(loss.data):.6f}")
+
+            # Update rule: w = w - lr * grad. weights.data is updated in place,
+            # so the next graph.forward() automatically uses the new weights.
+            with no_grad():
+                weights.data -= self.learning_rate * weights.grad
+
         return np.round(weights.data, 5)
 
 

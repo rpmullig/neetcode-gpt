@@ -105,6 +105,46 @@ class Model(ABC):
         # .detach: drop the autograd tracking; torch.round: round to 5 decimals
         return torch.round(weights.detach(), decimals=5)
 
+    # --- Component: the training loop, FROZEN (static graph) ------------
+    # Same math, but we freeze the forward pass into a static graph with
+    # torch.jit.trace (a built-in feature — no torch.compile, which needs a C++
+    # compiler this machine lacks). The traced graph runs the forward without
+    # Python op-dispatch overhead; autograd still flows through it for backward.
+    def train_model_traced(
+        self,
+        X: Tensor,
+        Y: Tensor,
+        num_iterations: int,
+        initial_weights: Tensor,
+        verbose: bool = False,
+    ) -> Tensor:
+        X = torch.as_tensor(X, dtype=torch.float64)
+        Y = torch.as_tensor(Y, dtype=torch.float64)
+        weights = torch.as_tensor(
+            initial_weights, dtype=torch.float64
+        ).clone().requires_grad_(True)
+
+        # Trace forward+loss into a frozen graph, ONCE, using example inputs.
+        def loss_fn(X, w, Y):
+            return self.loss(self.forward(X, w), Y)
+
+        # torch.jit.trace: record the ops into a reusable ScriptFunction
+        traced = torch.jit.trace(loss_fn, (X, weights, Y))
+
+        for iteration in range(num_iterations):
+            # Run the frozen forward; autograd still builds the backward graph.
+            loss = traced(X, weights, Y)
+            loss.backward()
+
+            if verbose:
+                print(f"iter {iteration:>4}  loss={loss.item():.6f}")
+
+            with torch.no_grad():
+                weights -= self.learning_rate * weights.grad
+                weights.grad.zero_()
+
+        return torch.round(weights.detach(), decimals=5)
+
 
 class LinearRegression(Model):
     """Ordinary least squares: predict a continuous value."""
