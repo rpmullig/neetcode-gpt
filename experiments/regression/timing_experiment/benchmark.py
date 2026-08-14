@@ -37,7 +37,7 @@ import matplotlib.pyplot as plt
 
 
 # ---- knobs -----------------------------------------------------------------
-SAMPLE_SIZES = [100, 500, 1_000, 5_000, 10_000, 50_000, 100_000]
+SAMPLE_SIZES = [100, 1_000, 10_000, 100_000, 300_000, 1_000_000]
 NUM_FEATURES = 8            # weights to learn (plus a bias column)
 NUM_ITERATIONS = 300        # gradient-descent steps per training run
 REPEATS = 3                 # take the best of N timings (reduces noise)
