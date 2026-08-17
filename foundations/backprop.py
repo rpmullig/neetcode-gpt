@@ -13,12 +13,21 @@ class Solution:
         # Forward: z = dot(x, w) + b, y_hat = sigmoid(z)
         # Loss: L = 0.5 * (y_hat - y_true)^2
         # Return: (dL_dw rounded to 5 decimals, dL_db rounded to 5 decimals)
-        z = np.dot(x,w) + b
-        y_hat = 1 / (1 + np.exp(-z))
-        loss = ((y_hat - y_true)**2) / 2
         
-        dl_dw = np.dot(np.dot((y_hat - y_true), y_hat*(1 - y_hat)),x)
-        dl_db = np.dot((y_hat - y_true), y_hat*(1 - y_hat))
-
-        return [np.round(dl_dw, 5), np.round(dl_db,5)]
-
+        # 1. Forward Pass
+        z = np.dot(x, w) + b
+        y_hat = 1 / (1 + np.exp(-z))
+        
+        # 2. Compute the shared gradient component (Chain Rule)
+        # dL/dy_hat = (y_hat - y_true)
+        # dy_hat/dz = y_hat * (1 - y_hat)
+        delta = (y_hat - y_true) * (y_hat * (1 - y_hat))
+        
+        # 3. Compute Gradients
+        # dL/dw = delta * dz/dw = delta * x
+        # dL/db = delta * dz/db = delta * 1
+        dl_dw = delta * x
+        dl_db = delta
+        
+        # 4. Return as a tuple with requested precision
+        return (np.round(dl_dw, 5), round(float(dl_db), 5))
