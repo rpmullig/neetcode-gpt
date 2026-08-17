@@ -3,11 +3,9 @@ from numpy.typing import NDArray
 
 
 class Solution:
-    
-    
-
-    
-    def forward(self, x: NDArray[np.float64], w: NDArray[np.float64], b: float, activation: str) -> float:
+    def forward(
+        self, x: NDArray[np.float64], w: NDArray[np.float64], b: float, activation: str
+    ) -> float:
         # x: 1D input array
         # w: 1D weight array (same length as x)
         # b: scalar bias
@@ -17,6 +15,11 @@ class Solution:
         # Sigmoid: σ(z) = 1 / (1 + exp(-z))
         # ReLU: max(0, z)
         # return round(your_answer, 5)
-        
-        activation_functions = { "sigmoid": lambda z: 1/(1+ np.exp(-z)), "relu": lambda z : np.maximum(0,z)}
-        return np.round(activation_functions[activation](np.dot(w,x) + b) , 5)
+
+        activation_functions = {
+            "sigmoid": lambda z: 1 / (1 + np.exp(-z)),
+            "relu": lambda z: np.maximum(0, z),
+        }
+
+        z = np.dot(w, x) + b
+        return np.round(activation_functions[activation](z), 5)
